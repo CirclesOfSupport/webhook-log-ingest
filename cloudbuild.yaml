@@ -1,0 +1,88 @@
+# Cloud Build -> Artifact Registry -> Cloud Run JOB (x2, same image).
+#
+# NOTE ON THE ENV-VAR / RESOURCE-FLAG TRAP: for SERVICES, the auto-generated Cloud
+# Build trigger ignores --memory/--timeout/--set-env-vars in this file and they must
+# be set in the console (contacts-sync OOM'd at 512MiB for exactly this reason). That
+# trap does NOT apply here: this yaml runs `gcloud run jobs deploy` EXPLICITLY as a
+# build step, so these flags ARE the deploy. They take effect. Do not also set them
+# in the console -- the next build would silently revert them.
+
+steps:
+  # 1. Build the image once. Both jobs run it; only the entrypoint differs.
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    args:
+      - build
+      - -t
+      - us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/webhook-log-ingest:$COMMIT_SHA
+      - -t
+      - us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/webhook-log-ingest:latest
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    id: push
+    args:
+      - push
+      - --all-tags
+      - us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/webhook-log-ingest
+
+  # 2. The ingest job.
+  #
+  #    --max-retries=0 IS DELIBERATE. Cloud Run's own retry would re-run the whole
+  #    crawl on a failure, and the two most likely failures -- an expired cookie and
+  #    a stale parser -- are NOT transient. Retrying them just hammers TextIt's UI
+  #    three times and delays the alert. The ingest is idempotent (MERGE on
+  #    httplog_id), so the NEXT hourly run picks up anything missed. Retry buys
+  #    nothing here and costs alert latency.
+  #
+  #    --task-timeout=30m: an hourly incremental is ~25 pages / ~2 min. 30m is
+  #    generous headroom for a catch-up run after a few missed hours, while still
+  #    guaranteeing the job cannot overlap its own next trigger.
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy-ingest
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - deploy
+      - webhook-log-ingest
+      - --image=us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/webhook-log-ingest:$COMMIT_SHA
+      - --region=us-east1
+      - --service-account=webhook-log-ingest@$PROJECT_ID.iam.gserviceaccount.com
+      - --set-env-vars=SECRET_PROJECT=$PROJECT_ID,TEXTIT_COOKIE_SECRET=textit-session-cookie,MAX_PAGES=120
+      - --memory=1Gi
+      - --cpu=1
+      - --task-timeout=30m
+      - --max-retries=0
+
+  # 3. The freshness check. SAME IMAGE, different entrypoint, SEPARATE JOB.
+  #
+  #    It is a separate job -- not a step inside the ingest -- because a check that
+  #    runs inside the thing it checks cannot fire when that thing never runs. That
+  #    is the entire gap this migration exists to close. Do not "simplify" this by
+  #    folding it into main.py.
+  #
+  #    64MiB and one query: this is a COUNT and a MAX. It costs nothing.
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy-freshness
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - deploy
+      - webhook-log-freshness
+      - --image=us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/webhook-log-ingest:$COMMIT_SHA
+      - --region=us-east1
+      - --service-account=webhook-log-ingest@$PROJECT_ID.iam.gserviceaccount.com
+      - --command=python
+      - --args=freshness_check.py
+      - --set-env-vars=STALE_HOURS=3
+      - --memory=512Mi
+      - --task-timeout=5m
+      - --max-retries=1
+
+images:
+  - us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/webhook-log-ingest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
