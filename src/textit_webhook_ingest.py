@@ -7,7 +7,8 @@ Incremental ingest of the TextIt webhook HTTP log into BigQuery.
     RESPONSES.webhook_log         list rows, indefinite retention
     RESPONSES.webhook_log_detail  headers + bodies, 30d native partition expiry
 
-WHERE THIS RUNS: Cloud Run job `webhook-log-ingest`, hourly via Cloud Scheduler.
+WHERE THIS RUNS: Cloud Run SERVICE `webhook-log-ingest`, hourly via a Cloud Scheduler
+    job that POSTs to /run.
     Migrated off Logan's workstation 2026-07-14 (was a Windows Scheduled Task).
 
     TextIt exposes NO API for the webhook HTTP log (TESTED 2026-07-11: the
@@ -15,7 +16,7 @@ WHERE THIS RUNS: Cloud Run job `webhook-log-ingest`, hourly via Cloud Scheduler.
     programmatic login is blocked by AWS WAF (TESTED 2026-07-13). So the session
     cookie is still captured by a HUMAN -- but it now lives in Secret Manager
     rather than Windows Credential Manager, and the BigQuery credential is the
-    job's runtime service account rather than user ADC. Both of the credentials
+    service's runtime service account rather than user ADC. Both of the credentials
     that failed in production are addressed; the manual cookie capture is
     relocated, not removed. See src/textit_webhook_failures.py get_cookie().
 
@@ -86,38 +87,14 @@ CHECKPOINT_EVERY = 500
 
 def bq_client() -> bigquery.Client:
     """
-    The Cloud Run job's RUNTIME SERVICE ACCOUNT. No key file, no ADC, nothing to expire.
+    Ambient service-account credentials (ADC) -- the Cloud Run runtime service
+    account. Same pattern as every other service in the stack (vamc-sync,
+    contacts-sync). No key file, no user ADC, nothing to expire.
 
-    THIS IS THE ENTIRE POINT OF THE MIGRATION. The local version authenticated with
-    USER ADC (`gcloud auth application-default login`), and on 2026-07-13 -- the FIRST
-    scheduled run -- that credential expired and the job died. Nothing was lost only
-    because it failed at 05:00 while Logan was watching. Had it expired on a Friday we
-    would have found out Tuesday, and TextIt retains ~3.85 days: those rows would have
-    been deleted at the source and unrecoverable. The pipeline's own auth had
-    reintroduced the exact failure mode the pipeline exists to prevent.
-
-    A workload-identity service account does not expire. This failure mode is gone
-    permanently -- not mitigated, gone.
-
-    Required roles on the runtime SA (least privilege -- dataset ACL, NOT project-wide
-    dataEditor):
-        roles/bigquery.jobUser        on project early-alert-responses
-        roles/bigquery.dataEditor     on dataset RESPONSES only
-        roles/secretmanager.secretAccessor  on secret textit-session-cookie only
+    Runtime SA needs, on early-alert-responses:
+        roles/bigquery.dataEditor + roles/bigquery.jobUser
     """
-    try:
-        client = bigquery.Client(project=PROJECT)
-        # Force a real credential check now, not at first query.
-        client.query("SELECT 1").result()
-        return client
-    except Exception as exc:
-        die(
-            "BigQuery auth failed. This should NOT happen on a Cloud Run job -- the\n"
-            "runtime service account does not expire. Check that the job's SA holds:\n"
-            "    roles/bigquery.jobUser     (project early-alert-responses)\n"
-            "    roles/bigquery.dataEditor  (dataset RESPONSES)\n"
-            f"Underlying error: {exc}"
-        )
+    return bigquery.Client(project=PROJECT)
 
 
 def die(msg: str) -> None:

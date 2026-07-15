@@ -62,6 +62,13 @@ def parse_args():
     return p.parse_args()
 
 
+class CookieError(RuntimeError):
+    """Session cookie missing, empty, or rejected (401/403). Raised (not
+    a process exit) so the Flask /run handler catches it and returns a clean
+    500 with a structured ingest_failed log line, instead of taking down the
+    gunicorn worker."""
+
+
 def get_cookie() -> str:
     """
     The TextIt session cookie, from Secret Manager.
@@ -99,19 +106,16 @@ def get_cookie() -> str:
         path = f"projects/{project}/secrets/{name}/versions/latest"
         return sm.access_secret_version(name=path).payload.data.decode("utf-8").strip()
     except Exception as exc:
-        print(f"Could not read secret '{name}' from Secret Manager: {exc}",
-              file=sys.stderr)
-        sys.exit(2)
+        raise CookieError(
+            f"Could not read secret '{name}' from Secret Manager: {exc}")
 
 
 def make_session() -> requests.Session:
     cookie = get_cookie()
     if not cookie:
-        print("TextIt session cookie is EMPTY. Re-capture it from the browser and "
-              "add a new version:\n"
-              "  gcloud secrets versions add textit-session-cookie --data-file=-",
-              file=sys.stderr)
-        sys.exit(2)
+        raise CookieError(
+            "TextIt session cookie is EMPTY. Re-capture it and add a new version: "
+            "gcloud secrets versions add textit-session-cookie --data-file=-")
     s = requests.Session()
     s.headers.update({
         "Cookie": cookie.strip(),
@@ -140,10 +144,9 @@ def get_page(session: requests.Session, page: int) -> str:
             wait = int(r.headers.get("Retry-After", "5") or 5)
             time.sleep(wait); continue
         if r.status_code in (401, 403):
-            print(f"HTTP {r.status_code} on page {page} — session cookie is missing "
-                  f"or expired. Re-capture TEXTIT_COOKIE from the browser.",
-                  file=sys.stderr)
-            sys.exit(2)
+            raise CookieError(
+                f"HTTP {r.status_code} on page {page} - session cookie is missing "
+                f"or expired. Re-capture the cookie into Secret Manager.")
         if r.status_code == 404:
             raise EndOfLog(page)
         r.raise_for_status()

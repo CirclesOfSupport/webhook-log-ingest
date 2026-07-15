@@ -1,347 +1,125 @@
 # webhook-log-ingest
 
-Hourly ingest of the TextIt webhook HTTP log into BigQuery, plus an independent
-freshness check. Two Cloud Run **jobs**, one image, one repo.
+Cloud Run **service** that ingests the TextIt webhook HTTP log into BigQuery
+(`RESPONSES.webhook_log` + `webhook_log_detail`). Called hourly by Cloud
+Scheduler. Replaces a Windows Scheduled Task that ran on Logan's workstation.
 
-I built this to replace a Windows Scheduled Task that ran on my workstation. It is
-the source for `RESPONSES.webhook_log` and `RESPONSES.webhook_log_detail`, which
-back the `webhook-log-api` service.
+Same shape as the other Early Alert services (`vamc-sync`, `contacts-sync`):
+Flask app, `/health` + a work endpoint, deployed from this repo via Cloud Build,
+`--no-allow-unauthenticated` + IAM.
 
----
+## Endpoints
 
-## Why this exists
+- `GET /health` -> `{"status":"ok"}`
+- `POST /run` -> pages the log, MERGEs new rows, returns
+  `{"status":"success","pages":N,"rows_scanned":N,"ingested":N}`
 
-TextIt exposes **no API** for the webhook HTTP log. The workspace advertises 24
-endpoints; `http_logs` and `webhook_events` both 404. The only access is the
-authenticated HTML console at `textit.com/httplog/webhooks/`, so this pages that
-console and parses it.
+Incremental: walks the httplog newest-first and stops at the stored
+`MAX(httplog_id)` watermark. Idempotent -- MERGE on `httplog_id`, so a double run
+cannot duplicate a row.
 
-And TextIt retains only **~3.85 days** of that log. Anything not ingested inside
-that window is deleted at the source and is **unrecoverable from anywhere**. That
-retention floor is the deadline behind every design decision in this repo — it is
-why the job fails loudly rather than writing zero rows, and why silent failure is
-the primary risk here rather than a bug.
+## Why it exists / why it moved off the local machine
 
-## Why it moved off my machine
+TextIt exposes **no API** for the webhook HTTP log (24 endpoints advertised;
+`http_logs` and `webhook_events` both 404). The only access is the authenticated
+HTML console, so this pages it and parses it. TextIt retains only **~3.85 days**
+of that log -- anything not ingested in that window is deleted at the source and
+is unrecoverable, which is why a stale parser fails loud rather than writing zero
+rows.
 
-The local version ran hourly on an always-on workstation and authenticated to
-BigQuery with **user ADC**. Two things broke, and the first was not hypothetical:
+The local version authenticated to BigQuery with **user ADC**, which expired on
+its first scheduled run. The runtime service account does not expire.
 
-1. **User ADC expired on the first scheduled run.** The job died. Nothing was lost
-   only because it failed at 05:00 while I was watching. Had it expired on a
-   Friday, I'd have found out Tuesday — past the retention floor.
-2. **Windows Credential Manager lost the TextIt cookie.** Not expired — *absent*.
-   `cmdkey /list` returned `* NONE *` and six consecutive runs failed. No audit
-   trail, undiagnosable.
-3. **Nothing could report that the job never ran.** Machine off, Docker down, task
-   disabled → no alert, because nothing executed to send one.
+## Auth
 
-A Cloud Run job's runtime service account does not expire, Secret Manager does not
-silently drop secrets, and the freshness check below fires even when the job never
-starts.
+`--no-allow-unauthenticated`. The only caller is Cloud Scheduler, which mints a
+Google OIDC token -- IAM gates the door, per the stack rule that auth follows the
+caller. No app-layer shared secret is needed (`SYNC_PASSWORD` is an optional
+second layer, left unset). Grant the Scheduler SA `roles/run.invoker`.
 
-## What it does NOT fix
+## The TextIt session cookie
 
-**A human still captures the cookie.** TextIt sits behind **AWS WAF** bot
-protection: the login POST returns 202 with a JS challenge from `token.awswaf.com`,
-and the resulting session is pre-auth, not authenticated. No header, no cookie, no
-form field gets around that — it is exactly what it exists to prevent. Programmatic
-login is impossible and this is settled; **do not re-probe it.**
+The scraper needs a logged-in browser session cookie. Programmatic login is
+blocked by AWS WAF, so a human captures it; it lives in **Secret Manager**
+(`textit-session-cookie`, read at `:latest` every run -- refresh is one
+`gcloud secrets versions add`, no redeploy). The runtime SA needs
+`roles/secretmanager.secretAccessor` on that secret.
 
-So when TextIt invalidates the session, the job fails loudly and I re-capture the
-cookie. This migration **relocates** that manual step from Credential Manager to
-Secret Manager. It does not remove it.
+To refresh after a `cookie_expired` failure: log in to textit.com, DevTools ->
+Application -> Cookies, copy the Cookie header, then
+`gcloud secrets versions add textit-session-cookie --data-file=-`.
 
----
+## Deploy (per cloud_run_service_deploy runbook)
 
-## Architecture
+Cloud Run -> **Services** -> **Connect repo** -> Continuously deploy from a
+repository -> Cloud Build -> select `CirclesOfSupport/webhook-log-ingest` ->
+branch `^main$`, build type **Dockerfile** -> service name `webhook-log-ingest`,
+region **us-east1**, **Require authentication** -> set env vars in the
+**Variables & Secrets** tab BEFORE Create.
 
-```
-Cloud Scheduler (hourly, :20, 05-23 America/Chicago)
-    └─> Cloud Run job  webhook-log-ingest
-            ├─ cookie  <- Secret Manager  textit-session-cookie:latest
-            ├─ BigQuery <- runtime service account (no key, nothing to expire)
-            └─ stdout  -> {"event":"ingest_failed","reason":"cookie_expired",...}
-                              └─> log-based alert -> email
+- **First build fails** with `invalid value for build.service_account`. Set the
+  trigger's Service account to `853176470965-compute@developer.gserviceaccount.com`,
+  Save, Run. Then it builds clean.
+- **Env vars and memory go in the console, not `cloudbuild.yaml`** -- the
+  auto-trigger ignores those flags in the yaml (the contacts-sync OOM). This
+  repo's yaml deliberately omits them.
 
-Cloud Scheduler (hourly, :50, 06-23 America/Chicago)   [SEPARATE CLOCK]
-    └─> Cloud Run job  webhook-log-freshness
-            └─ "when did BigQuery last receive a row?"
-               stdout -> {"event":"freshness_failed","reason":"stale",...}
-                              └─> log-based alert -> email
-```
+### Env vars (console)
 
-**The freshness check is a separate job on a separate schedule, and that is the
-whole point.** A check that runs inside the ingest cannot fire when the ingest
-never runs. `main.py` answers *"did the run work?"*; `freshness_check.py` answers
-*"is the data actually current?"* — and the second has an honest answer whether the
-ingest succeeded, failed, lied, or never started. Do not fold it into `main.py`.
+- `SECRET_PROJECT=early-alert-responses`
+- `TEXTIT_COOKIE_SECRET=textit-session-cookie`
+- `MAX_PAGES=120`
+- (`SYNC_PASSWORD` -- leave unset; IAM is the gate)
 
-Both alerts overlap on a loud failure and I get two emails. That's the correct
-trade. The failure that must never be silent is the one where nothing fires at all.
+### Runtime SA roles (on early-alert-responses)
 
-| file | role |
-|---|---|
-| `src/main.py` | ingest job entrypoint; structured-log alerting |
-| `src/freshness_check.py` | **separate job**; staleness + duplicate-key guard |
-| `src/textit_webhook_failures.py` | httplog scraper + cookie from Secret Manager |
-| `src/textit_webhook_ingest.py` | watermark, dedupe, MERGE, integrity assertions |
-| `src/textit_webhook_detail.py` | detail-page parser + credential masking |
+`roles/bigquery.dataEditor` + `roles/bigquery.jobUser` +
+`roles/secretmanager.secretAccessor` (on the cookie secret).
 
----
-
-## Deploy
-
-### 1. Create the repo as `lparker1119`
-
-**This matters.** The Cloud Build GitHub App only reliably sees repos created by
-that account — a repo created by any other account won't appear in the connect
-dropdown, and `gcloud builds triggers create github` fails with
-`FAILED_PRECONDITION: Repository mapping does not exist`. This is what stranded
-`nightly-orchestrator`.
-
-### 2. Runtime service account (least privilege)
-
-A dedicated SA, not the default compute SA. Scoped to exactly what the job needs:
+## Smoke test before scheduling (PowerShell)
 
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+$token = gcloud auth print-identity-token
+Invoke-RestMethod -Uri "https://<service-url>/health" -Headers @{ Authorization = "Bearer $token" }
 
-$PROJ = "early-alert-responses"
-$SA   = "webhook-log-ingest@$PROJ.iam.gserviceaccount.com"
-
-gcloud iam service-accounts create webhook-log-ingest `
-  --display-name="Webhook log ingest job" --project=$PROJ
-
-# BigQuery: jobUser at PROJECT level (running a query needs it), but dataEditor
-# scoped to the RESPONSES DATASET only -- not project-wide.
-gcloud projects add-iam-policy-binding $PROJ `
-  --member="serviceAccount:$SA" --role="roles/bigquery.jobUser"
+$token = gcloud auth print-identity-token
+Invoke-RestMethod -Uri "https://<service-url>/run" -Method POST `
+  -Headers @{ Authorization = "Bearer $token" } -ContentType "application/json" -Body '{}'
 ```
 
-Dataset-level `dataEditor` is not settable via `add-iam-policy-binding` — it's a
-dataset ACL:
+Expect `status: success`. Only then attach Scheduler.
 
-```powershell
-bq show --format=prettyjson "$PROJ`:RESPONSES" > ds.json
-# add to the "access" array, then:
-#   { "role": "WRITER", "userByEmail": "webhook-log-ingest@early-alert-responses.iam.gserviceaccount.com" }
-bq update --source=ds.json "$PROJ`:RESPONSES"
-```
+## Cloud Scheduler
 
-### 3. The cookie secret
+Create Job -> region us-east1 -> `20 5-23 * * *` (or your chosen cadence),
+time-zone **America/Chicago** -> target HTTP, the service URL + `/run`, method
+POST, body `{}` -> add an OIDC token (the Scheduler SA). Force-run once to
+confirm.
 
-```powershell
-gcloud secrets create textit-session-cookie --replication-policy=automatic --project=$PROJ
+## Alerting (add later -- not required to go live)
 
-gcloud secrets add-iam-policy-binding textit-session-cookie `
-  --member="serviceAccount:$SA" --role="roles/secretmanager.secretAccessor"
-```
+Failures emit a structured log line: `jsonPayload.event="ingest_failed"` at ERROR
+severity, with `jsonPayload.reason` (cookie_expired / parser_stale / bq_auth /
+integrity / unknown) and `jsonPayload.detail`.
 
-Then add the value — see **Refreshing the cookie** below.
-
-### 4. Cloud Build trigger
-
-Connect the repo, branch `^main$`, config file `cloudbuild.yaml` (**not**
-Dockerfile — this yaml deploys two jobs, it isn't just a build).
-
-**The first build WILL fail** with `invalid value for build.service_account`
-(INVALID_ARGUMENT, `gen1_repo_trigger`). It happens every single time. Fix: Cloud
-Build → Triggers → open the trigger → set **Service account** to
-`853176470965-compute@developer.gserviceaccount.com` → Save → Run.
-
-The build SA also needs to be able to deploy jobs and act as the runtime SA:
-
-```powershell
-$BUILD = "853176470965-compute@developer.gserviceaccount.com"
-
-gcloud projects add-iam-policy-binding $PROJ `
-  --member="serviceAccount:$BUILD" --role="roles/run.developer"
-
-gcloud iam service-accounts add-iam-policy-binding $SA `
-  --member="serviceAccount:$BUILD" --role="roles/iam.serviceAccountUser"
-```
-
-### 5. Smoke test — run each job by hand before scheduling anything
-
-```powershell
-gcloud run jobs execute webhook-log-ingest --region=us-east1 --wait
-gcloud run jobs execute webhook-log-freshness --region=us-east1 --wait
-```
-
-Then **read the log line**, don't just check the exit code:
-
-```powershell
-gcloud logging read `
-  'resource.type=cloud_run_job AND jsonPayload.event!=""' `
-  --limit=5 --format="value(jsonPayload.event, jsonPayload.reason, jsonPayload.detail)"
-```
-
-Expect `ingest_ok` and `freshness_ok`. Only then attach Scheduler.
-
-### 6. Cloud Scheduler
-
-Scheduler triggers a **job** via the Cloud Run Admin API, not by POSTing to a URL.
-It needs `roles/run.invoker` on the job.
-
-**Note the 03:00–05:00 exclusion** — that window is reserved for Meridian's
-Available Means ETL and Early Alert jobs must stay out of it.
-
-```powershell
-$SCHED_SA = "webhook-log-scheduler@$PROJ.iam.gserviceaccount.com"
-gcloud iam service-accounts create webhook-log-scheduler --project=$PROJ
-
-foreach ($job in @("webhook-log-ingest","webhook-log-freshness")) {
-  gcloud run jobs add-iam-policy-binding $job --region=us-east1 `
-    --member="serviceAccount:$SCHED_SA" --role="roles/run.invoker"
-}
-
-# INGEST -- hourly at :20, 05:00-23:00 CT. Same window the local task ran.
-gcloud scheduler jobs create http webhook-log-ingest-hourly `
-  --location=us-east1 `
-  --schedule="20 5-23 * * *" `
-  --time-zone="America/Chicago" `
-  --uri="https://run.googleapis.com/v2/projects/$PROJ/locations/us-east1/jobs/webhook-log-ingest:run" `
-  --http-method=POST `
-  --oauth-service-account-email=$SCHED_SA
-
-# FRESHNESS -- :50, offset 30 min AFTER the ingest so it reads a settled table.
-# Starts at 06 so the first check follows a real ingest rather than alerting on
-# an overnight gap that is expected.
-gcloud scheduler jobs create http webhook-log-freshness-hourly `
-  --location=us-east1 `
-  --schedule="50 6-23 * * *" `
-  --time-zone="America/Chicago" `
-  --uri="https://run.googleapis.com/v2/projects/$PROJ/locations/us-east1/jobs/webhook-log-freshness:run" `
-  --http-method=POST `
-  --oauth-service-account-email=$SCHED_SA
-```
-
-Use `--time-zone`, never a fixed-UTC cron — a UTC cron drifts an hour across DST.
-
----
-
-## Alerting — "how will I see this when it fails at 5am?"
-
-Answering that literally is a hard requirement before anything unattended ships,
-so:
-
-Every terminal state writes **one structured JSON line** to stdout. Cloud Logging
-lifts a bare JSON object into `jsonPayload`. Log-based alert policies watch it and
-email me, with the cause **in the subject line**.
-
-```
-jsonPayload.event   ingest_ok | ingest_failed | freshness_ok | freshness_failed
-jsonPayload.reason  cookie_expired | parser_stale | bq_auth | integrity | stale | duplicates
-jsonPayload.detail  the child's REAL output (last 4000 chars)
-```
-
-`detail` carrying the child's actual stdout is deliberate. The local wrapper's
-alert email showed only a PowerShell stack trace while the real diagnosis —
-`BigQuery auth failed. If ADC expired, re-run: gcloud auth application-default
-login` — was printed by the child and thrown away. An alert that can't say what
-broke has only moved the debugging to a worse moment.
-
-### Create the two policies
-
-```powershell
-gcloud logging metrics create webhook_ingest_failures `
-  --description="Terminal failures of the webhook-log ingest or freshness job" `
-  --log-filter='resource.type="cloud_run_job" AND (jsonPayload.event="ingest_failed" OR jsonPayload.event="freshness_failed")'
-```
-
-Then Monitoring → Alerting → Create policy on that metric, condition **any value >
-0**, notification channel = my email.
-
-**Do not rebuild the de-duplication logic in Python.** The PowerShell wrapper kept
-a JSON state file to email once per failure streak, re-alert every 6h, and send one
-RECOVERED notice. That was ~80 lines and was rewritten three times (it reported
-FAILURE on successful runs, then UNVERIFIED on successful runs, then couldn't say
-what broke when it genuinely failed). A Monitoring policy does all four natively:
-
-| PowerShell behavior | Monitoring equivalent |
-|---|---|
-| email on first failure only | one incident opens; no re-notify |
-| re-alert every 6h | `notification_rate_limit: 21600s` |
-| one-time RECOVERED notice | `auto_close` — Monitoring emails on close |
-| record every run regardless | every run is in Cloud Logging |
-
-### Third guard: metric-absence
-
-The two policies above fire when a job *runs and fails*. Add one that fires when
-the ingest **stops producing any line at all** — the "job never ran" case, from the
-other side:
-
-Monitoring → Create policy → condition type **Metric absence** on a log metric
-counting `jsonPayload.event="ingest_ok"`, trigger after **3 hours**.
-
-Belt and braces with `freshness_check.py`, on purpose. Metric-absence catches *"the
-job never ran."* Freshness catches *"the job ran, exited 0, and moved no data"* —
-which is the Meridian ETL Defect-B signature, where two Required steps failed and
-the pipeline still emailed SUCCESS. Neither is sufficient alone.
-
----
-
-## Refreshing the cookie
-
-The job exits **2** with `reason: cookie_expired` and the alert names it. Then:
-
-1. Log in to `textit.com` in a browser.
-2. DevTools → Application → Cookies → copy the full `Cookie` header value
-   (`sessionid=...; csrftoken=...`).
-3. Add a new secret version — the job reads `:latest`, so **no redeploy**:
-
-```powershell
-gcloud secrets versions add textit-session-cookie --data-file=- --project=early-alert-responses
-# paste the cookie, then Ctrl-Z + Enter (Windows)
-```
-
-4. Re-run immediately rather than waiting for the next hour:
-
-```powershell
-gcloud run jobs execute webhook-log-ingest --region=us-east1 --wait
-```
-
-The ingest is idempotent (MERGE on `httplog_id`), so it picks up everything the
-failed runs missed. No manual catch-up.
-
----
-
-## What must not be lost if this is ever rewritten
-
-All of it was learned the hard way and all of it is load-bearing.
-
-- **Two modes.** Incremental **stops at** `MAX(httplog_id)`; backfill **steps
-  over** stored rows. The watermark is a *ceiling* — incremental mode structurally
-  **cannot** backfill. A 200-page backfill once ingested 27 rows and exited in two
-  minutes because it hit the watermark on page 1 and broke.
-- **MERGE does not dedupe its own source.** The scraper pages a *live* list while
-  webhooks fire (~10/min), so a row can appear on two pages and both take
-  `WHEN NOT MATCHED` and both INSERT. Dedupe the batch **before** staging. The
-  standing `COUNT(*) == COUNT(DISTINCT httplog_id)` assertion runs on every write.
-- **A failed detail fetch must DEFER the whole pair.** Never write a list row
-  without its body — the watermark advances past it and the body can never be
-  re-fetched. A permanent, invisible hole.
-- **404 past the last page is the normal end of the log** (~1,600 pages), not an
-  error. Treating it as fatal crashed a backfill at page 1600 and discarded 1,599
-  pages of work.
-- **Checkpoint every 500 rows.** A crash mid-crawl must not discard the run.
-- **Credentials are masked at ingest**, in headers *and* bodies, irreversibly.
-  `webhook_log_detail` is a PII store regardless.
-- **Fail non-zero rather than writing zero rows.** A stale parser after a TextIt
-  reskin would otherwise look like a quiet day — and under 3.85-day retention, a
-  quiet day noticed on day five is permanent loss.
-- **`PYTHONUNBUFFERED=1`.** Without it, stdout buffers and nothing reaches Cloud
-  Logging until the process exits, so a hung job looks identical to one that never
-  started.
+To email on failure: create a log-based metric on that filter, then a Cloud
+Monitoring alert policy with an email notification channel. First-failure-only,
+re-alert throttle, and recovery notice are native to the policy. **No code change
+needed** -- the log line is already emitted.
 
 ## This repo is PUBLIC
 
-No credentials in source, in **any** form — not in code, not as a default value,
-not in a docstring example, not in a committed `.pyc`. All four of those happened
-in `sheet-service` and the password was world-readable from its first commit.
+No credentials in source, in any form (code, default value, docstring example,
+committed `.pyc`). The cookie is in Secret Manager; env vars are set in the
+console, not committed.
 
-The cookie lives in Secret Manager. It does **not** go in a Cloud Run env var
-either: env vars are plaintext to anyone with `roles/run.viewer` via a read-only
-`gcloud run services describe`, and this cookie is a live TextIt session with
-console access to subscriber PII.
+## What must not be lost if rewritten
+
+Incremental **stops at** the watermark (a ceiling) -- it structurally cannot
+backfill; backfill is a separate `run_ingest(backfill=True)` path that steps over
+stored rows. MERGE does **not** dedupe its own source (live-list page drift ->
+duplicate `httplog_id`s; dedupe the batch before staging; `COUNT(*)==COUNT(DISTINCT)`
+asserted every write). A failed detail fetch **DEFERs the whole pair** (a list row
+without a body is a permanent hole once the watermark passes). 404 past the last
+page is the normal end of the log. Credentials masked at ingest, headers and
+bodies. **Fail non-zero rather than write zero rows.**
