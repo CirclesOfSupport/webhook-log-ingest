@@ -93,6 +93,22 @@ def run():
     if SYNC_PASSWORD and body.get("password") != SYNC_PASSWORD:
         return jsonify({"status": "error", "message": "Unauthorized"}), 403
 
+    # Backfill mode (one-time gap repair, not the hourly path). Incremental stops
+    # at the watermark and so CANNOT fill an interior hole -- e.g. the 21k-row gap
+    # left when a killed catch-up run set the watermark near the top. Backfill
+    # ignores the watermark and pages DOWN, skipping already-stored rows (no
+    # wasted detail fetches), so it fills holes. Resumable: each call re-pages
+    # from the top and continues into whatever is still missing; chunks compose.
+    #
+    #   POST {"backfill": true, "max_pages": 400}
+    #
+    # max_pages override lets a backfill page far deeper than the hourly ceiling
+    # (120) without raising the steady-state ceiling. Bounded per call so one
+    # request still finishes inside the 3600s timeout; run repeatedly until the
+    # gap query shows the hole closed.
+    backfill = bool(body.get("backfill", False))
+    max_pages = int(body.get("max_pages", MAX_PAGES))
+
     try:
         session = make_session()
 
@@ -101,7 +117,7 @@ def run():
         matches = []
         scanned = 0
         page = 0
-        while page < MAX_PAGES:
+        while page < max_pages:
             page += 1
             try:
                 html = get_page(session, page)
@@ -164,7 +180,7 @@ def run():
         # watermark, source-batch dedupe before MERGE, DEFER-the-pair on a failed
         # detail fetch, 500-row checkpoints, and the COUNT(*)==COUNT(DISTINCT)
         # integrity assertion. It raises on any of them.
-        run_ingest(session, ing_rows, BASE, MAX_PAGES, dry_run=False, backfill=False)
+        run_ingest(session, ing_rows, BASE, max_pages, dry_run=False, backfill=backfill)
 
     except CookieError as e:
         # Typed, so it is labelled cookie_expired regardless of the message text
@@ -181,9 +197,9 @@ def run():
 
     return jsonify({
         "status": "success",
+        "mode": "backfill" if backfill else "incremental",
         "pages": page,
         "rows_scanned": scanned,
-        "ingested": len(ing_rows),
     }), 200
 
 
