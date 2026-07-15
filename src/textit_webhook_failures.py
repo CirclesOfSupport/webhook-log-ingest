@@ -150,6 +150,37 @@ def get_page(session: requests.Session, page: int) -> str:
         if r.status_code == 404:
             raise EndOfLog(page)
         r.raise_for_status()
+
+        # THE 200-LOGIN-PAGE TRAP.
+        #
+        # A dead/expired cookie does NOT get a 401/403 here. TextIt answers 200
+        # and returns the LOGIN PAGE HTML. Without this check, parse_rows() finds
+        # no table.list, returns zero rows, and the caller reads that as "nothing
+        # new -> success". So a logged-out session and a caught-up pipeline look
+        # IDENTICAL (both rows_scanned:0, status:success), and the ingest silently
+        # stops while the table goes stale under the ~3.85-day retention cliff.
+        # (Found in production 2026-07-14: /run returned success with 0 scanned
+        # while the table was 11h stale and the local freshness check was emailing
+        # failures.)
+        #
+        # A real httplog page ALWAYS contains <table class="list">. The login page
+        # never does -- it carries a password field and/or points at the login
+        # endpoint. If the log table is absent AND login markers are present, the
+        # cookie is dead: fail loud instead of returning an empty success.
+        body_l = r.text.lower()
+        has_log_table = ('class="list"' in body_l) or ("class='list'" in body_l)
+        looks_like_login = (
+            'name="password"' in body_l
+            or 'type="password"' in body_l
+            or "/users/login" in body_l
+            or 'id="id_username"' in body_l
+        )
+        if not has_log_table and looks_like_login:
+            raise CookieError(
+                f"HTTP 200 on page {page} but TextIt returned the LOGIN PAGE, not "
+                f"the webhook log -- the session cookie is expired or invalid. "
+                f"Re-capture it into Secret Manager (textit-session-cookie).")
+
         return r.text
     raise RuntimeError(f"Repeated 429s on page {page}")
 

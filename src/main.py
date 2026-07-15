@@ -5,7 +5,7 @@ import traceback
 
 from flask import Flask, request, jsonify
 
-from textit_webhook_failures import make_session, get_page, parse_rows, row_time, EndOfLog, BASE
+from textit_webhook_failures import make_session, get_page, parse_rows, row_time, EndOfLog, CookieError, BASE
 from textit_webhook_ingest import run_ingest
 
 app = Flask(__name__)
@@ -111,6 +111,23 @@ def run():
                 break
             rows, _total = parse_rows(html)
             if not rows:
+                # PAGE-1 ZERO-ROWS IS SUSPICIOUS, not a quiet day.
+                #
+                # get_page already catches the recognizable login page (200 +
+                # password field). This catches the residual case: a 200 that is
+                # neither the log table nor a page we recognize as login -- a
+                # generic redirect, an error shell, a reskin. An active pipeline
+                # ALWAYS has recent fires, so zero parseable rows on the very
+                # first page means we are not looking at the real log. Fail loud
+                # rather than returning an empty success and letting the table go
+                # stale. Page 2+ returning empty is the normal end of new rows.
+                if page == 1:
+                    msg = ("page 1 returned zero parseable rows -- not the webhook "
+                           "log (bad cookie, redirect, or changed HTML). Refusing "
+                           "to report success on an empty read.")
+                    emit_failure("cookie_expired", msg)
+                    return jsonify({"status": "error", "reason": "cookie_expired",
+                                    "message": msg}), 500
                 break
             scanned += len(rows)
             matches.extend(rows)
@@ -148,6 +165,13 @@ def run():
         # detail fetch, 500-row checkpoints, and the COUNT(*)==COUNT(DISTINCT)
         # integrity assertion. It raises on any of them.
         run_ingest(session, ing_rows, BASE, MAX_PAGES, dry_run=False, backfill=False)
+
+    except CookieError as e:
+        # Typed, so it is labelled cookie_expired regardless of the message text
+        # (the login-page message contains no keyword classify() would match).
+        emit_failure("cookie_expired", str(e))
+        return jsonify({"status": "error", "reason": "cookie_expired",
+                        "message": str(e)}), 500
 
     except Exception as e:
         tb = traceback.format_exc()
