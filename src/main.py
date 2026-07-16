@@ -6,7 +6,7 @@ import traceback
 from flask import Flask, request, jsonify
 
 from textit_webhook_failures import make_session, get_page, parse_rows, row_time, EndOfLog, CookieError, BASE
-from textit_webhook_ingest import run_ingest
+from textit_webhook_ingest import run_ingest, get_watermark, bq_client
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +27,16 @@ SYNC_PASSWORD = os.environ.get("SYNC_PASSWORD", "")
 # ~15k rows/day and 25 rows/page an hour of traffic is ~25 pages; 120 gives ~5h
 # of slack for a missed run without ever letting the crawl hammer TextIt's UI.
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "120"))
+
+# Incremental safety ceiling. Incremental now pages DOWN until it reaches the
+# stored watermark (proving a contiguous fetch -- no interior hole), rather than
+# stopping at a fixed page count and possibly leaving a gap between what it
+# scraped and the watermark. But an unbounded loop could run past the 3600s
+# request timeout after a long outage, so we cap it: if the scrape has not
+# reached the watermark within this many pages, stop and leave a CONTIGUOUS
+# TRAILING EDGE (safely resumable next run), never an interior hole. A normal
+# hour is a few hundred rows (~a dozen pages), nowhere near this.
+INCREMENTAL_CEILING = int(os.environ.get("INCREMENTAL_CEILING", "1500"))
 
 
 def emit_failure(reason: str, detail: str) -> None:
@@ -107,10 +117,39 @@ def run():
     # request still finishes inside the 3600s timeout; run repeatedly until the
     # gap query shows the hole closed.
     backfill = bool(body.get("backfill", False))
-    max_pages = int(body.get("max_pages", MAX_PAGES))
+
+    # Page ceiling:
+    #   backfill    -> caller's max_pages (deep, bounded per call)
+    #   incremental -> INCREMENTAL_CEILING (page until we REACH the watermark;
+    #                  the ceiling is only a runtime seatbelt, not the normal stop)
+    if backfill:
+        max_pages = int(body.get("max_pages", MAX_PAGES))
+    else:
+        max_pages = int(body.get("max_pages", INCREMENTAL_CEILING))
 
     try:
         session = make_session()
+
+        # In incremental mode we must page DOWN until the scrape reaches the
+        # stored watermark. Stopping at a fixed page count while more-than-that
+        # new rows exist is EXACTLY what punched the interior holes (2026-07-15,
+        # -16): the newest N were ingested, the watermark jumped to the top, and
+        # the rows between the old watermark and the oldest scraped page were
+        # orphaned forever (incremental never looks below the watermark again).
+        #
+        # So: fetch the watermark up front, and let the loop stop as soon as a
+        # scraped page contains an id <= watermark (proof the fetch is contiguous
+        # back to stored data). If we hit the ceiling first, we stop with a
+        # CONTIGUOUS TRAILING EDGE -- the next run resumes from the new (higher
+        # but still contiguous) watermark. Never an interior hole.
+        reached_watermark = False
+        if not backfill:
+            try:
+                watermark = get_watermark(bq_client())
+            except Exception:
+                watermark = None  # empty table / first run -> page to ceiling
+        else:
+            watermark = None
 
         # Page newest-first, collecting every fire (success + failure).
         # webhook_log is the volume/success-rate record, not just a failure log.
@@ -126,6 +165,11 @@ def run():
                 # pages), not an error.
                 break
             rows, _total = parse_rows(html)
+            if rows and not backfill and watermark is not None:
+                # Reached stored data? Then this scrape is contiguous to the
+                # watermark and we can stop after including this page.
+                if min(r.get("httplog_id") or 0 for r in rows) <= watermark:
+                    reached_watermark = True
             if not rows:
                 # PAGE-1 ZERO-ROWS IS SUSPICIOUS, not a quiet day.
                 #
@@ -147,6 +191,8 @@ def run():
                 break
             scanned += len(rows)
             matches.extend(rows)
+            if reached_watermark:
+                break
 
         # Build the ingest rows. Drop only rows missing an id or a timestamp.
         ing_rows = []
@@ -173,6 +219,18 @@ def run():
             msg = f"scraped {scanned} rows but parsed ZERO usable -- TextIt HTML likely changed"
             emit_failure("parser_stale", msg)
             return jsonify({"status": "error", "reason": "parser_stale", "message": msg}), 500
+
+        # If incremental exhausted the ceiling without reaching the watermark,
+        # a large backlog remains. This is SAFE (contiguous trailing edge, resumes
+        # next run) but worth surfacing so a persistent backlog is visible.
+        if (not backfill) and watermark is not None and not reached_watermark \
+                and page >= max_pages:
+            logger.warning(json.dumps({
+                "event": "incremental_ceiling_hit",
+                "detail": (f"paged {page} pages without reaching watermark "
+                           f"{watermark}; backlog remains, will continue next run"),
+                "severity": "WARNING",
+            }))
 
         ing_rows.sort(key=lambda x: x["httplog_id"], reverse=True)
 
