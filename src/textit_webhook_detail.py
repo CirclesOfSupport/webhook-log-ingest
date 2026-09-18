@@ -29,8 +29,7 @@ MERGE, and is irreversible.
 NOTE — THIS REPO IS PUBLIC. The placeholders above are placeholders. The real
 values do NOT go in this file, not even as a docstring example. A credential in
 a docstring is one of the four ways sheet-service leaked its password to the
-world (see Atlas early_alert/entities/credential_exposure.md); the private
-version of this file carried the live get-responses_v2 token here.
+world; the private version of this file carried a live service token here.
 """
 from __future__ import annotations
 

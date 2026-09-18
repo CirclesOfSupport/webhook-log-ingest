@@ -88,7 +88,7 @@ def get_cookie() -> str:
     WHY A HUMAN STILL HAS TO REFRESH IT (settled 2026-07-13, do not re-litigate):
       TextIt sits behind AWS WAF bot protection. Programmatic login is IMPOSSIBLE --
       the POST returns 202 with a challenge page requiring JS execution in a real
-      browser (probe_textit_login.py / probe_textit_login2.py in kriton-dev/EarlyAlert).
+      browser -- confirmed by two separate login-probe scripts.
       No header, no cookie, no form field gets around it; that is what it exists to
       prevent. When TextIt invalidates the session, this job fails LOUD (exit 2) and
       Logan re-captures. That is the accepted cost.
