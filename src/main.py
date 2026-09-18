@@ -85,7 +85,7 @@ def health():
 def run():
     """
     Page TextIt's webhook HTTP log and MERGE new rows into
-    RESPONSES.webhook_log (+ webhook_log_detail). Called hourly by Cloud
+    OPS.webhook_log (+ webhook_log_detail). Called hourly by Cloud
     Scheduler, or on-demand.
 
     Incremental: walks the newest-first list and stops at the stored

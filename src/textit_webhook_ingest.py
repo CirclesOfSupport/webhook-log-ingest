@@ -4,8 +4,8 @@ textit_webhook_ingest.py
 ========================
 Incremental ingest of the TextIt webhook HTTP log into BigQuery.
 
-    RESPONSES.webhook_log         list rows, indefinite retention
-    RESPONSES.webhook_log_detail  headers + bodies, 30d native partition expiry
+    OPS.webhook_log         list rows, indefinite retention
+    OPS.webhook_log_detail  headers + bodies, 30d native partition expiry
 
 WHERE THIS RUNS: Cloud Run SERVICE `webhook-log-ingest`, hourly via a Cloud Scheduler
     job that POSTs to /run.
@@ -59,7 +59,7 @@ from textit_webhook_detail import (
 )
 
 PROJECT = "early-alert-responses"
-DATASET = "RESPONSES"
+DATASET = "OPS"
 T_LOG = f"{PROJECT}.{DATASET}.webhook_log"
 T_DETAIL = f"{PROJECT}.{DATASET}.webhook_log_detail"
 

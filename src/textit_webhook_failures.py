@@ -47,7 +47,7 @@ def parse_args():
     p.add_argument("--verbose", action="store_true")
     # --- BigQuery ingest mode ---
     p.add_argument("--ingest", action="store_true",
-                   help="Ingest into BigQuery (RESPONSES.webhook_log + webhook_log_detail) "
+                   help="Ingest into BigQuery (OPS.webhook_log + webhook_log_detail) "
                         "instead of writing a CSV. Incremental: stops at the highest "
                         "httplog_id already stored. Idempotent (MERGE).")
     p.add_argument("--backfill", action="store_true",
