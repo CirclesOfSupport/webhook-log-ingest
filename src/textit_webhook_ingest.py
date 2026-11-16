@@ -294,6 +294,11 @@ def run_ingest(
         lo, hi = min(ids), max(ids)
         stored = get_stored_ids(client, lo, hi)
         new_rows = [r for r in list_rows if r["httplog_id"] not in stored]
+        # Oldest first. TextIt deletes the log from its oldest end, so after an
+        # outage the rows nearest to being deleted are fetched before the newer
+        # ones, which stay at the source for days. Each row is committed with its
+        # own detail, so the order changes nothing else.
+        new_rows.sort(key=lambda r: r["httplog_id"])
         print(f"[backfill] scraped {len(list_rows)} rows spanning {lo}..{hi}")
         print(f"[backfill] {len(stored)} already stored (skipping detail fetch)")
         print(f"[backfill] {len(new_rows)} to fetch")
