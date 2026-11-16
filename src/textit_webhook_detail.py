@@ -6,12 +6,15 @@ Parser + credential-masking for TextIt httplog DETAIL pages
 (/httplog/read/<id>/), plus the BigQuery ingest for the webhook_log pipeline.
 
 Structure of the detail page is TESTED (2026-07-11, six pages: one 200 plus all
-five failure shapes). See early_alert/handoffs/open/2026-07-11_webhook_log_pipeline.md
+five failure shapes).
 
 Two payload containers, both plain server-rendered HTML:
     <pre class="prettyprint request">   raw HTTP request
     <pre class="prettyprint response">  raw HTTP response
 Each is:  <first line> \n <headers...> \n <blank> \n <body>
+From 2026-11-12 TextIt renders the same text in a new layout: <div class="hlog-card">
+blocks, each a "Request" or "Response" label bar and a bare <pre> (highlight spans
+inside). _find_request_response() reads both layouts.
 
 *** CRITICAL — TIMEOUTS RENDER DIFFERENTLY (TESTED, id 121092906) ***
 For a timeout the response <pre> is PRESENT but contains only the literal
@@ -166,6 +169,37 @@ def _split_http_block(text: str) -> tuple[str, list[str], str]:
     return first_line, headers, body
 
 
+def _find_request_response(soup):
+    """
+    Locate the request and response <pre> blocks on a detail page.
+
+    Two layouts are known:
+      - through 2026-11-12: <pre class="prettyprint request"> / <pre class="prettyprint response">
+      - from 2026-11-12:    <div class="hlog"> holding two <div class="hlog-card">, each a
+                            <div class="hlog-bar"> whose first span reads "Request" or
+                            "Response", then a bare <pre> with the same raw HTTP text
+                            (syntax-highlight spans inside; get_text() returns the raw text).
+    Returns (request_pre, response_pre); either may be None.
+    """
+    req_pre = soup.find("pre", class_="request")
+    resp_pre = soup.find("pre", class_="response")
+    if req_pre is not None:
+        return req_pre, resp_pre
+
+    for card in soup.select("div.hlog-card"):
+        bar = card.find("div", class_="hlog-bar")
+        pre = card.find("pre")
+        if bar is None or pre is None:
+            continue
+        first = bar.find("span")
+        label = (first.get_text() if first is not None else bar.get_text()).strip().lower()
+        if label.startswith("request") and req_pre is None:
+            req_pre = pre
+        elif label.startswith("response") and resp_pre is None:
+            resp_pre = pre
+    return req_pre, resp_pre
+
+
 def parse_detail(page_html: str, httplog_id: int) -> dict:
     """
     Parse one /httplog/read/<id>/ page into the webhook_log_detail row shape.
@@ -175,13 +209,13 @@ def parse_detail(page_html: str, httplog_id: int) -> dict:
 
     soup = BeautifulSoup(page_html, "html.parser")
 
-    req_pre = soup.find("pre", class_="request")
-    resp_pre = soup.find("pre", class_="response")
+    req_pre, resp_pre = _find_request_response(soup)
 
     # --- structural self-check: loud, not silent ---
     if req_pre is None:
         raise DetailParseError(
-            f"httplog {httplog_id}: no <pre class='request'> found. "
+            f"httplog {httplog_id}: no request block found (neither <pre class='request'> "
+            "nor a 'Request' hlog-card). "
             "TextIt's httplog HTML has likely changed — the parser is stale. "
             "Do NOT ingest; fix the parser."
         )

@@ -97,10 +97,16 @@ def bq_client() -> bigquery.Client:
     return bigquery.Client(project=PROJECT)
 
 
+class IngestAborted(RuntimeError):
+    """Raised by die(). An exception, not sys.exit(): inside the gunicorn worker a
+    SystemExit is not caught by the /run handler's `except Exception`, so the worker
+    dies, the request ends 503 and no ingest_failed line is written for the alert."""
+
+
 def die(msg: str) -> None:
     """Fail loud, fail non-zero. Never fail into a silent zero-row ingest."""
     print(f"\n!!! INGEST ABORTED\n{msg}\n", file=sys.stderr)
-    sys.exit(1)
+    raise IngestAborted(msg)
 
 
 def get_watermark(client: bigquery.Client) -> int | None:
@@ -426,7 +432,8 @@ def run_ingest(
               file=sys.stderr)
         print("    Run dedupe_webhook_log.sql, then investigate before ingesting again.",
               file=sys.stderr)
-        sys.exit(4)
+        raise IngestAborted(f"INTEGRITY FAILURE: webhook_log has {chk.n} rows but only "
+                            f"{chk.d} distinct httplog_ids")
 
     print(f"\n[ingest] MERGED {n1} rows -> webhook_log")
     print(f"[ingest] MERGED {n2} rows -> webhook_log_detail")
@@ -443,5 +450,5 @@ def run_ingest(
               file=sys.stderr)
         print("    These must match. A list row without a body is unrecoverable "
               "once the watermark advances.", file=sys.stderr)
-        sys.exit(5)
+        raise IngestAborted(f"INTEGRITY FAILURE: merged {n1} list rows but {n2} detail rows")
     print("[ingest] done")
